@@ -1,0 +1,39 @@
+name: INFRA-TEST-PIPELINE
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  terraform-test:
+    uses: ./.github/workflows/deploy.yaml
+    with:
+      resource_app: "azurerm_resource_group_template_deployment.workflow[0]"
+
+      CONFIG: test
+      APPROVE: ${{ github.event.inputs.Approve }}
+
+      # OSAM CONFIGS
+      targetEnv: dev
+      isProduction: false
+
+      # TERRAFORM CONFIGS
+      TERRAFORM_DIR: ./
+      TERRAFORM_VERSION: 1.9.2
+      ARM_SUBSCRIPTION_ID: 'eff306cd-8a1e-4679-a349-67f88bfb6f62'
+      ARM_TENANT_ID: 'db05faca-c82a-4b9d-b9c5-0f64b6755421'
+      VARIABLES_FILE: 'test.tfvars'
+      TF_BACKEND_RG: 'cde-pipeline-terraform-rg-test'
+      TF_BACKEND_ACCOUNT: 'cdepipelinetest'
+      TF_BACKEND_LOCATION: 'centralus'
+      TF_BACKEND_CONTAINER: 'tfstate'
+      TF_BACKEND_KEY: 'infra_test.tfstate'
+      TF_BACKEND_PLAN: 'test_plan.tfplan'
+      ARM_CLIENT_ID: '2ce2dc46-6fda-40d0-8b96-fe95ae42854c'
+
+    secrets:
+      ARM_CLIENT_SECRET: '${{ secrets.DE_SP_CLIENT_SECRET_TEST }}'
+      OPEN_API_KEY: '${{ secrets.OPENAI_API_KEY }}'

@@ -1,0 +1,251 @@
+name: infra-deploy
+on:
+  workflow_call:
+    inputs:
+      resource_app:
+        required: true
+        type: string
+      config:
+        required: true
+        type: string
+      targetEnv:
+        required: true
+        type: string
+      isProduction:
+        required: true
+        type: string
+      TERRAFORM_DIR:
+        required: true
+        type: string
+      TERRAFORM_VERSION:
+        required: true
+        type: string
+      ARM_CLIENT_ID:
+        required: true
+        type: string
+      ARM_SUBSCRIPTION_ID:
+        required: true
+        type: string
+      ARM_TENANT_ID:
+        required: true
+        type: string
+      VARIABLES_FILE:
+        required: true
+        type: string
+      TF_BACKEND_RG:
+        required: true
+        type: string
+      TF_BACKEND_ACCOUNT:
+        required: true
+        type: string
+      TF_BACKEND_LOCATION:
+        required: true
+        type: string
+      TF_BACKEND_CONTAINER:
+        required: true
+        type: string
+      TF_BACKEND_KEY:
+        required: true
+        type: string
+      TF_BACKEND_PLAN:
+        required: true
+        type: string
+      APPROVE:
+        required: true
+        type: string
+
+    secrets:
+      ARM_CLIENT_SECRET:
+        required: true
+      OPEN_API_KEY:
+        required: true
+
+env:
+  CONFIG: ${{ inputs.CONFIG }}
+  targetEnv: ${{ inputs.targetEnv }}
+  isProduction: ${{ inputs.isProduction }}
+  APPROVE: ${{ inputs.APPROVE }}
+  TERRAFORM_DIR: ${{ inputs.TERRAFORM_DIR }}
+  TERRAFORM_VERSION: ${{ inputs.TERRAFORM_VERSION }}
+  ARM_CLIENT_ID: ${{ inputs.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{secrets.ARM_CLIENT_SECRET}}
+  ARM_SUBSCRIPTION_ID: ${{inputs.ARM_SUBSCRIPTION_ID}}
+  ARM_TENANT_ID: ${{inputs.ARM_TENANT_ID}}
+  VARIABLES_FILE: ${{inputs.VARIABLES_FILE}}
+  TF_BACKEND_RG: ${{inputs.TF_BACKEND_RG}}
+  TF_BACKEND_ACCOUNT: ${{inputs.TF_BACKEND_ACCOUNT}}
+  TF_BACKEND_LOCATION: ${{inputs.TF_BACKEND_LOCATION}}
+  TF_BACKEND_CONTAINER: ${{inputs.TF_BACKEND_CONTAINER}}
+  TF_BACKEND_KEY: ${{inputs.TF_BACKEND_KEY}}
+  TF_BACKEND_PLAN: ${{inputs.TF_BACKEND_PLAN}}
+  OPEN_API_KEY: ${{secrets.OPEN_API_KEY}}
+
+jobs:
+  build_and_deploy:
+    runs-on: [ uhg-runner ]
+    name: Plan
+    steps:
+
+      - name: Checkout GitHub Actions Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: uhg-actions/setup-terraform@v3
+        with:
+          terraform_version: ${{env.TERRAFORM_VERSION}}
+          terraform_wrapper: false
+
+      - name: Setup artifactory as proxy for terraform providers
+        run: |
+          cat <<EOF > $HOME/.terraformrc
+            provider_installation {
+              direct {
+                exclude = ["registry.terraform.io/*/*"]
+              }
+              network_mirror {
+                url = "https://repo1.uhc.com/artifactory/api/terraform/terraform-virtual/providers/"
+              }
+            }
+          EOF
+
+      - name: Login to Azure CLI
+        run: |
+          az login --service-principal --username ${{env.ARM_CLIENT_ID}} --password ${{env.ARM_CLIENT_SECRET}} --tenant ${{env.ARM_TENANT_ID}}
+
+
+      - name: Terraform Init
+        run: |
+          cd $TERRAFORM_DIR
+          terraform init -backend-config="storage_account_name=${{env.TF_BACKEND_ACCOUNT}}" -backend-config="key=${{env.TF_BACKEND_KEY}}" -backend-config="resource_group_name=${{env.TF_BACKEND_RG}}" -backend-config="container_name=${{env.TF_BACKEND_CONTAINER}}"
+
+
+      - name: Terraform Plan
+        run: |
+          cd $TERRAFORM_DIR
+          terraform plan \
+             -var cde_sp_client_secret="${{env.ARM_CLIENT_SECRET}}" \
+             -var cde_sp_client_id="${{env.ARM_CLIENT_ID}}" \
+             -var open_api_key="${{env.OPEN_API_KEY}}" \
+             -var-file="${{env.VARIABLES_FILE}}" \
+             -input=false \
+             -out "${{env.TF_BACKEND_PLAN}}"
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{env.TF_BACKEND_PLAN}}
+          path: ./${{env.TF_BACKEND_PLAN}}
+
+
+  apply:
+    needs: build_and_deploy
+    runs-on: [ uhg-runner ]
+    environment:
+      name: '${{ inputs.config }}'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: uhg-actions/setup-terraform@v3
+        with:
+          terraform_version: ${{env.TERRAFORM_VERSION}}
+          terraform_wrapper: false
+
+      - name: Setup artifactory as proxy for terraform providers
+        run: |
+          cat <<EOF > $HOME/.terraformrc
+            provider_installation {
+              direct {
+                exclude = ["registry.terraform.io/*/*"]
+              }
+              network_mirror {
+                url = "https://repo1.uhc.com/artifactory/api/terraform/terraform-virtual/providers/"
+              }
+            }
+          EOF
+
+
+      - name: Login to Azure CLI
+        run: |
+          az login --service-principal --username ${{env.ARM_CLIENT_ID}} --password ${{env.ARM_CLIENT_SECRET}} --tenant ${{env.ARM_TENANT_ID}}
+          az account set --subscription ${{env.ARM_SUBSCRIPTION_ID}}
+
+      - name: Terraform Init
+        run: |
+          cd $TERRAFORM_DIR
+          terraform init -backend-config="storage_account_name=${{env.TF_BACKEND_ACCOUNT}}" -backend-config="key=${{env.TF_BACKEND_KEY}}" -backend-config="resource_group_name=${{env.TF_BACKEND_RG}}" -backend-config="container_name=${{env.TF_BACKEND_CONTAINER}}"
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{env.TF_BACKEND_PLAN}}
+          path: ./
+
+      - name: Terraform Apply
+        run: |
+          cd $TERRAFORM_DIR
+          terraform apply "${{env.TF_BACKEND_PLAN}}"
+
+      - name: Send OSAM Event
+        run: |
+          # Read the YAML content from a file  
+          yaml_content=$(cat vitals.yaml)  
+          while IFS=: read -r key value; do
+          key=$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr -cd '[[:alnum:]_]')
+          value=$(echo "$value" | sed 's/^[ \t]*//;s/[ \t]*$//')
+          export "$key"="$value"
+          done < vitals.yaml 
+
+          # VITALS CONFIGS
+          ask_id=$askid
+          ca_agile_id=$caagileid
+          project_key=$projectkey
+
+          # Get the current epoch timestamp  
+          timestamp_ms=$(($(date +%s) * 1000 + $(date +%N) / 1000000))
+            
+          # Get the latest Git commit  
+          github_actions_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          git_commit=$(git rev-parse HEAD)
+          git_branch=${GITHUB_REF#refs/heads/}
+          git_run_id=${{ github.run_id }}
+          git_url=https://github.com/${{ github.repository }}
+          pipeline_name=$(basename ${{ github.repository }})
+            
+          # Build the JSON  
+          json='{  
+            "eventData": {
+              "type": "pipeline.deploy",  
+              "duration_ms": 0,  
+              "reportingTool": "Github Actions",  
+              "reportingToolURL": "'"$github_actions_url"'",  
+              "timestamp_ms": '"$timestamp_ms"',  
+              "status": "SUCCESS"
+            },
+            "pipelineData": {  
+              "pipelineId": "'"$git_run_id"'",  
+              "projectKey": "'"$project_key"'",  
+              "gitCommit": "'"$git_commit"'",
+              "gitBranch": "'"$git_branch"'",
+              "gitURL": "'"$git_url"'",
+              "caAgileId": "'"$ca_agile_id"'",  
+              "askId": ["'"$ask_id"'"],  
+              "pipelineLibraries": [],  
+              "isTestMode": false  
+            },  
+            "deployData": {  
+              "isProduction": '"$isProduction"',  
+              "platform": "Navigator",  
+              "targetEnv": "'"$targetEnv"'",  
+              "targetName": "'"$pipeline_name"'"
+            }
+          }'  
+            
+          # Print the final JSON  
+          echo "$json"  
+
+          # Send OSAM EVENT
+          curl --location 'http://kafkaposter-pipeline-events.optum.com/postevent' \
+          --header 'Content-Type: application/json' \
+          --data "$json" 
